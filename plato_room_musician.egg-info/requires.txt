@@ -1,0 +1,6 @@
+flux-tensor-midi
+numpy>=1.24
+mido>=1.3
+
+[dev]
+pytest>=7.0
