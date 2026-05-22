@@ -31,6 +31,18 @@ class NoteEvent:
             raise ValueError(
                 f"MIDI channel must be 0-15, got {self.channel}"
             )
+        if not (0 <= self.velocity <= 127):
+            raise ValueError(
+                f"velocity must be 0-127, got {self.velocity}"
+            )
+        if not (0 <= self.pitch <= 127):
+            raise ValueError(
+                f"pitch must be 0-127, got {self.pitch}"
+            )
+        if self.duration_beats < 0:
+            raise ValueError(
+                f"duration_beats must be non-negative, got {self.duration_beats}"
+            )
 
     @property
     def end_beats(self) -> float:

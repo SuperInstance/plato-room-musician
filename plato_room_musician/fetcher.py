@@ -117,13 +117,22 @@ class SyntheticFetcher:
     def _make_tile(self, room_name: str, category: str, idx: int, t: float) -> dict:
         agent = self.rng.choice(AGENTS)
         confidence = self.rng.random()
-        content = self.rng.choice(TILE_SEEDS) % (
-            room_name,
-            self.rng.randint(0, 127),
-            self.rng.random(),
-            self.rng.randint(2, 8),
-            agent,
-        )
+        template = self.rng.choice(TILE_SEEDS)
+        # Each template has different format specifiers, so build a
+        # per-template arg list instead of a one-size-fits-all tuple.
+        _fmt_args = {
+            "Harmonic convergence detected in room %s": lambda: (room_name,),
+            "Tile submitted by %s at beat %d": lambda: (agent, self.rng.randint(0, 127)),
+            "Constraint satisfaction: SAT for kernel K%d": lambda: (self.rng.randint(2, 8),),
+            "Fleet heartbeat OK — all rooms in tempo": lambda: (),
+            "Deadband funnel stable at ε=%.3f": lambda: (self.rng.random() * 50, ),
+            "Holonomy check: zero drift across %d rooms": lambda: (self.rng.randint(2, 8),),
+            "Eisenstein snap applied to rhythm grid": lambda: (),
+            "INT8 saturation adds %.4f drift — inaudible": lambda: (self.rng.random() * 0.01,),
+            "Laman rigidity holds for %d-voice fugue": lambda: (self.rng.randint(2, 8),),
+            "Nod received from %s — ensemble agrees": lambda: (agent,),
+        }
+        content = template % _fmt_args[template]()
         # Content length determines duration later
         return {
             "room": room_name,
