@@ -6,35 +6,31 @@ Score arrangement: turns mapped tiles into a composed score.
 - Rest detection: gaps in a room's timeline become explicit rests.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Sequence
 
 
+@dataclass(frozen=True)
 class NoteEvent:
     """A canonical musical event derived from a PLATO tile."""
 
-    def __init__(
-        self,
-        room: str,
-        channel: int,
-        pitch: int,
-        velocity: int,
-        onset_beats: float,
-        duration_beats: float,
-        patch: int,
-        agent: str,
-        category: str,
-        tile_id: str = "",
-    ):
-        self.room = room
-        self.channel = channel
-        self.pitch = pitch
-        self.velocity = velocity
-        self.onset_beats = onset_beats
-        self.duration_beats = duration_beats
-        self.patch = patch
-        self.agent = agent
-        self.category = category
-        self.tile_id = tile_id
+    room: str
+    channel: int
+    pitch: int
+    velocity: int
+    onset_beats: float
+    duration_beats: float
+    patch: int
+    agent: str
+    category: str
+    tile_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.channel <= 15):
+            raise ValueError(
+                f"MIDI channel must be 0-15, got {self.channel}"
+            )
 
     @property
     def end_beats(self) -> float:
@@ -124,7 +120,7 @@ class PlatoScore:
             return self
         min_onset = min(e.onset_beats for e in self._events)
         for e in self._events:
-            e.onset_beats -= min_onset
+            object.__setattr__(e, 'onset_beats', e.onset_beats - min_onset)
         self._normalized = True
         return self
 
