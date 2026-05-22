@@ -1,457 +1,616 @@
-# PLATO Room Musician — User Guide
+# User Guide — plato-room-musician
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Installation](#installation)
-3. [Fetching Room Data](#fetching-room-data)
-4. [Mapping Rooms to Music](#mapping-rooms-to-music)
-5. [Building a Score](#building-a-score)
-6. [Deadband Filtering](#deadband-filtering)
-7. [Chord and Rest Detection](#chord-and-rest-detection)
-8. [Rendering to MIDI](#rendering-to-midi)
-9. [Rendering to Tensor-MIDI](#rendering-to-tensor-midi)
-10. [Rendering to Visual Music Score](#rendering-to-visual-music-score)
-11. [Full Pipeline Example](#full-pipeline-example)
-12. [Configuration Reference](#configuration-reference)
-13. [Common Patterns](#common-patterns)
-14. [Troubleshooting](#troubleshooting)
-
----
+2. [Core concepts](#core-concepts)
+3. [Fetching data](#fetching-data)
+4. [Room and tile mapping](#room-and-tile-mapping)
+5. [Score composition](#score-composition)
+6. [Rendering to MIDI](#rendering-to-midi)
+7. [Tensor-MIDI rendering](#tensor-midi-rendering)
+8. [Visual Music Score](#visual-music-score)
+9. [Input/output formats](#inputoutput-formats)
+10. [Configuration reference](#configuration-reference)
+11. [Use cases](#use-cases)
+12. [Troubleshooting](#troubleshooting)
 
 ## Overview
 
-PLATO Room Musician transcribes fleet activity into music. It connects to PLATO rooms (or generates synthetic data), maps room categories to instruments/scales/registers, arranges tiles into a temporal score, and renders the output as MIDI, Tensor-MIDI, or Visual Music Score (VMS) JSON.
+plato-room-musician sonifies PLATO room activity as music. The pipeline:
 
-The isomorphism: Room = Musician (MIDI channel), Tile = Note (pitch/velocity/onset/duration), Agent = Instrument patch, Category = Scale/register.
+1. **Fetch** tile data from PLATO (or generate synthetic data)
+2. **Map** rooms → MIDI channels/instruments, tiles → notes
+3. **Compose** a temporal score with chord/rest detection and deadband filtering
+4. **Render** to MIDI file, Tensor-MIDI bytes, or Visual Music Score JSON
 
-## Installation
+## Core concepts
 
-```bash
-git clone https://github.com/SuperInstance/plato-room-musician.git
-cd plato-room-musician
-pip install -e .
-```
+### The isomorphism
 
-## Fetching Room Data
+| PLATO concept | Musical concept |
+|--------------|----------------|
+| Room | Musician (MIDI channel + instrument) |
+| Tile | Note (pitch, velocity, onset, duration) |
+| Agent | Instrument variant (program change) |
+| Category | Scale, register, rhythmic role |
+| Room activity burst | Musical phrase |
+| Multi-room coordination | Chord/harmony |
+| Fleet idle period | Rest |
 
-### Live PLATO Server
+### Pitch mapping
+
+Pitch is derived deterministically from the tile's identity hash:
+
+1. SHA-256 hash of `tile_id:timestamp`
+2. Hash modulo scale length → scale degree
+3. Hash divided by scale length modulo octave range → octave offset
+4. `pitch = register_low + octave_offset + scale_degree`
+5. Clamped to `[register_low, register_high)`
+
+### Velocity mapping
+
+`velocity = confidence × 127`, clamped to [1, 127].
+
+### Duration mapping
+
+`duration_beats = max(0.25, min(4.0, len(content) / 40.0))` — longer answers produce longer notes, capped at 4 beats.
+
+## Fetching data
+
+### Live PLATO
 
 ```python
 from plato_room_musician import PlatoFetcher
 
-fetcher = PlatoFetcher(host="http://147.224.38.131:8847", timeout=5.0)
+fetcher = PlatoFetcher(
+    host="http://147.224.38.131:8847",  # default
+    timeout=5.0,
+)
 
 # List all rooms
 rooms = fetcher.get_rooms()
-for name, meta in rooms.items():
-    print(f"{name}: {meta}")
+# Returns: {"room-name": {"category": "...", ...}, ...}
 
-# Get tiles from one room
-room = fetcher.get_room("forgemaster-cadence", limit=50)
-tiles = room.get("tiles", [])
-print(f"Got {len(tiles)} tiles")
+# Get tiles for one room
+room_data = fetcher.get_room("forgemaster-anvil", limit=50)
+tiles = room_data["tiles"]  # list of tile dicts
 
-# Fetch everything
-all_tiles = fetcher.get_all_tiles()  # {room_name: [tiles]}
+# Get tiles for all rooms
+all_tiles = fetcher.get_all_tiles()
+# Returns: {"room-name": [tile_dicts], ...}
 ```
 
-### Synthetic Data (Always Available)
+### Synthetic fallback
 
 ```python
 from plato_room_musician import SyntheticFetcher
 
 fetcher = SyntheticFetcher(seed=42)
-
-rooms = fetcher.get_rooms()
-# 13 predefined rooms across 5 categories:
-# forgemaster (2), session (4), fleet (3), knowledge (2), constraint (2)
-
+rooms = fetcher.get_rooms()      # 13 synthetic rooms
 all_tiles = fetcher.get_all_tiles()
-for room_name, tiles in all_tiles.items():
-    print(f"{room_name}: {len(tiles)} tiles")
 ```
 
-### Auto-Fallback
+Synthetic rooms include: `forgemaster-cadence`, `forgemaster-anvil`, `session-deep-dive`, `session-ambient`, `fleet-coord`, `fleet-nav`, `fleet-comms`, `knowledge-archive`, `knowledge-index`, `constraint-checker`, `constraint-bounds`, `synthesis-oracle`, `research-log`.
+
+### Auto-detection
 
 ```python
 from plato_room_musician.fetcher import get_fetcher
 
-# Tries live PLATO, falls back to synthetic
+# Tries live PLATO first, falls back to synthetic
 fetcher = get_fetcher()
-all_tiles = fetcher.get_all_tiles()
 ```
 
-## Mapping Rooms to Music
+### Tile data format
+
+Each tile is a dict with these keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `room` | `str` | Room name |
+| `category` | `str` | Category prefix |
+| `agent` | `str` | Agent that submitted the tile |
+| `timestamp` | `float` | Unix timestamp |
+| `confidence` | `float` | 0.0–1.0 |
+| `question` | `str` | The question asked |
+| `answer` | `str` | The answer given |
+| `tile_id` | `str` | Unique tile identifier |
+
+## Room and tile mapping
 
 ### RoomMapper
-
-Maps room names to MIDI channels and category configs:
 
 ```python
 from plato_room_musician import RoomMapper
 
 rm = RoomMapper()
 
-# Deterministic channel assignment (0-15, collision-resolved)
-ch = rm.channel_for("forgemaster-anvil")     # e.g., 3
-ch2 = rm.channel_for("session-ambient")      # e.g., 7
+# Deterministic channel assignment (0-15)
+ch = rm.channel_for("forgemaster-anvil")   # e.g. 7
 
-# Musical config for a room
-config = rm.config_for("forgemaster-anvil")
+# Category config
+cfg = rm.config_for("forgemaster-anvil")
 # {
-#   'register': (36, 52),          # C2–E3 pitch range
-#   'patches': [30, 31, 32],       # distortion guitar, etc.
-#   'scale': [0, 2, 3, 5, 7, 8, 10],  # minor blues
-#   'rhythmic_role': 'root'
+#   "register": (36, 52),
+#   "patches": [30, 31, 32],
+#   "scale": [0, 2, 3, 5, 7, 8, 10],
+#   "rhythmic_role": "root",
 # }
 
-# Patch assignment based on agent
+# Instrument patch
 patch = rm.patch_for("forgemaster-anvil", {"agent": "forge-agent"})
+# Deterministic based on room + agent hash
 ```
-
-### Category Mappings
-
-| Category | Register | Character | Scale | Rhythmic Role |
-|----------|----------|-----------|-------|---------------|
-| forgemaster | C2–E3 | Industrial, low | Minor blues/Phrygian | root |
-| session | C3–G4 | Ambient pads | Major/Lydian | halftime |
-| fleet | B1–D3 | Percussive | Pentatonic | triplet |
-| knowledge | C5–C7 | Bells, chimes | Whole-tone/Lydian | waltz |
-| constraint | C1–G2 | Bass, grounded | Mixolydian | compound |
 
 ### TileMapper
 
-Maps individual tiles to note parameters:
-
 ```python
-from plato_room_musician import TileMapper, RoomMapper
+from plato_room_musician import TileMapper
 
-rm = RoomMapper()
-tm = TileMapper(rm)
+tm = TileMapper(room_mapper)
 
-# Map one tile
-tile = {
-    "room": "forgemaster-cadence",
-    "agent": "forge-agent",
-    "timestamp": 1700000000.0,
-    "confidence": 0.85,
-    "question": "Q0: Harmonic convergence",
-    "answer": "Constraint satisfaction: SAT for kernel K3",
-    "tile_id": "forgemaster-cadence-0000",
-}
-
-note = tm.map_tile("forgemaster-cadence", tile, tempo_bpm=120.0)
+note = tm.map_tile("forgemaster-anvil", tile, tempo_bpm=120.0)
+# Returns:
 # {
-#   'room': 'forgemaster-cadence',
-#   'channel': 3,
-#   'pitch': 42,
-#   'velocity': 108,        # confidence * 127
-#   'onset_beats': 1700000000.0,  # raw timestamp (normalized later)
-#   'duration_beats': 0.65, # content length / 40
-#   'patch': 31,
-#   'agent': 'forge-agent',
-#   'category': 'forgemaster',
-#   'rhythmic_role': 'root',
+#   "room": "forgemaster-anvil",
+#   "channel": 7,
+#   "pitch": 41,           # F#2 (in forgemaster register 36-52)
+#   "velocity": 89,        # confidence * 127
+#   "onset_beats": 345.2,  # from timestamp
+#   "duration_beats": 1.5, # from content length
+#   "patch": 31,           # guitar harmonics
+#   "agent": "forge-agent",
+#   "category": "forgemaster",
+#   "rhythmic_role": "root",
+#   "tile_id": "forgemaster-anvil-001a",
+#   "raw_tile": {...},     # original tile dict
 # }
 ```
 
-**Mapping rules:**
-- **Confidence → Velocity:** `int(confidence × 127)`, clamped to 1–127
-- **Content length → Duration:** `len(answer) / 40` beats, clamped to 0.25–4.0
-- **Tile hash → Pitch:** Deterministic hash selects scale degree within register
-- **Agent → Patch:** Deterministic hash selects from category's patch list
+### Custom category config
 
-## Building a Score
+Override `CATEGORY_CONFIG` before creating mappers:
 
 ```python
-from plato_room_musician import RoomMapper, TileMapper, PlatoScore
+from plato_room_musician.mapping import CATEGORY_CONFIG
 
-rm = RoomMapper()
-tm = TileMapper(rm)
+CATEGORY_CONFIG["custom"] = {
+    "register": (60, 79),
+    "patches": [40, 41, 42],
+    "scale": [0, 3, 5, 7, 10],  # minor pentatonic
+    "rhythmic_role": "swing",
+}
+```
 
-# Map all tiles
-fetcher = SyntheticFetcher(seed=42)
-all_tiles = fetcher.get_all_tiles()
+## Score composition
 
-mapped = []
-for room_name, tiles in all_tiles.items():
-    for tile in tiles:
-        mapped.append(tm.map_tile(room_name, tile, tempo_bpm=120.0))
+### Building a score
 
-# Build score
+```python
+from plato_room_musician import PlatoScore
+
+# From mapped tiles
 score = PlatoScore.from_mapped_tiles(
-    mapped,
-    deadband_semitones=2,     # pitch change threshold
-    deadband_velocity=10,     # velocity change threshold
-    chord_window_beats=0.5,   # window for chord detection
-    rest_threshold_beats=2.0, # minimum gap for a rest
+    mapped_tiles,
+    deadband_semitones=2,
+    deadband_velocity=10,
+    chord_window_beats=0.5,
+    rest_threshold_beats=2.0,
 )
 ```
 
-### Score Properties
+### Normalization
 
 ```python
-# Duration in beats
-print(f"Duration: {score.duration_beats:.1f} beats")
-
-# All events
-for ev in score.events[:10]:
-    print(f"  {ev.room} ch={ev.channel} pitch={ev.pitch} "
-          f"vel={ev.velocity} onset={ev.onset_beats:.2f}")
-
-# Summary
-print(score.summary())
-# {'rooms': [...], 'total_events': N, 'duration_beats': T,
-#  'chords': C, 'rests': R, 'chord_types': [...]}
+score.normalize_time()  # Shift all onsets so first = beat 0
 ```
 
-## Deadband Filtering
+Always call this before rendering. It's idempotent.
 
-Remove tiles that don't represent significant musical changes:
+### Deadband filtering
 
 ```python
 score.apply_deadband()
-
-# How it works per room:
-# 1. Sort events by onset time
-# 2. Keep first event
-# 3. For each subsequent event, keep only if:
-#    - pitch changed by > deadband_semitones, OR
-#    - velocity changed by > deadband_velocity
-before = len(score.events)
-score.apply_deadband()
-after = len(score.events)
-print(f"Deadband filter: {before} → {after} events")
 ```
 
-## Chord and Rest Detection
+Removes tiles where the pitch hasn't changed by more than `deadband_semitones` AND the velocity hasn't changed by more than `deadband_velocity` from the previous tile in the same room. This prevents auditory clutter from repetitive activity.
 
-### Chords
-
-Simultaneous activity across multiple rooms creates harmony:
+### Chord detection
 
 ```python
 chords = score.find_chords()
-for c in chords:
-    print(f"Beat {c['onset_beats']:.1f}: {c['type']} "
-          f"rooms={c['rooms']} ({len(c['notes'])} notes)")
+# [
+#   {
+#     "onset_beats": 12.5,
+#     "duration_beats": 0.8,
+#     "rooms": ["forgemaster-anvil", "session-deep-dive"],
+#     "notes": [...],
+#     "type": "triad",  # chord classification
+#   },
+#   ...
+# ]
 ```
 
-**Chord types:**
-- `triad` — contains third + fifth
-- `dyad-third` — third without fifth
-- `dyad-fifth` — fifth without third
-- `seventh-color` — includes 7th
-- `cluster` — dense chromatic collection
-- `unison` — single pitch class
+Chord types: `triad`, `dyad-third`, `dyad-fifth`, `seventh-color`, `cluster`, `unison`.
 
-### Rests
-
-Gaps in a room's activity become explicit rests:
+### Rest detection
 
 ```python
 rests = score.find_rests()
-for r in rests:
-    print(f"Room '{r['room']}': silence from beat {r['start_beats']:.1f} "
-          f"to {r['end_beats']:.1f} ({r['duration_beats']:.1f} beats)")
+# [
+#   {
+#     "room": "fleet-comms",
+#     "start_beats": 45.0,
+#     "end_beats": 52.3,
+#     "duration_beats": 7.3,
+#   },
+#   ...
+# ]
+```
+
+### Summary
+
+```python
+print(score.summary())
+# {
+#   "rooms": ["constraint-bounds", "constraint-checker", ...],
+#   "total_events": 234,
+#   "duration_beats": 1847.25,
+#   "chords": 12,
+#   "rests": 8,
+#   "chord_types": ["cluster", "dyad-fifth", "triad"],
+# }
 ```
 
 ## Rendering to MIDI
+
+### MidiRenderer
 
 ```python
 from plato_room_musician import MidiRenderer
 
 renderer = MidiRenderer(tempo_bpm=120.0, ticks_per_beat=480)
-
-# Render and save
-renderer.render(score, output_path="fleet_singing.mid")
+mid = renderer.render(score, output_path="fleet.mid")
 ```
 
 Output is a Type-1 MIDI file with:
-- Track 0: tempo + time signature
-- One track per channel (up to 16)
-- Program changes per channel
-- All note-on/note-off events with correct delta times
+- Track 0: tempo, time signature, metadata
+- One track per MIDI channel (up to 16)
+- Program changes per agent/room
+- Note-on/note-off events from the score
 
-## Rendering to Tensor-MIDI
+### Custom tempo
+
+```python
+renderer = MidiRenderer(tempo_bpm=140.0)  # faster playback
+```
+
+## Tensor-MIDI rendering
+
+Tensor-MIDI encodes each note as 4 bytes for neural synthesis:
+
+| Byte | Field | Encoding |
+|------|-------|----------|
+| 0 | `cos_int8` | cos(2π × pitch/12) × 127, INT8 saturated |
+| 1 | `sin_int8` | sin(2π × pitch/12) × 127, INT8 saturated |
+| 2 | `beat_k` | onset × beat_resolution, mod 256 |
+| 3 | `state_byte` | (channel << 4) \| (velocity >> 3) |
 
 ```python
 from plato_room_musician import TensorMidiRenderer
 
 renderer = TensorMidiRenderer(beat_resolution=24)
 
-# List of TensorMIDIEvent objects
+# List of events
 events = renderer.render(score)
-for ev in events[:3]:
-    print(f"cos={ev.cos_int8} sin={ev.sin_int8} beat={ev.beat_k} state=0x{ev.state_byte:02x}")
 
-# Raw binary (4 bytes per event)
+# Raw bytes
 raw = renderer.render_to_bytes(score)
-print(f"{len(raw)} bytes ({len(raw)//4} events)")
 
 # JSON
 json_str = renderer.render_to_json(score)
 ```
 
-**TensorMIDIEvent 4-byte format:**
+### TensorMIDIEvent
 
-| Byte | Field | Encoding |
-|------|-------|----------|
-| 0 | `cos_int8` | `cos(2π × pitch%12 / 12) × 127` |
-| 1 | `sin_int8` | `sin(2π × pitch%12 / 12) × 127` |
-| 2 | `beat_k` | `int(onset × resolution) % 256` |
-| 3 | `state_byte` | `(channel << 4) \| (velocity >> 3)` |
+```python
+event = events[0]
+print(event.cos_int8)     # -64
+print(event.sin_int8)     # 95
+print(event.beat_k)       # 142
+print(event.state_byte)   # 113
+print(event.to_bytes())   # b'\xc0\x5f\x8e\x71'
+print(event.to_dict())    # {"cos_int8": -64, "sin_int8": 95, ...}
+```
 
-## Rendering to Visual Music Score
+## Visual Music Score
+
+VMS is a 2D+time JSON format for visualization:
 
 ```python
 from plato_room_musician import VMSRenderer
 
 vms = VMSRenderer(width=1920, height=1080)
 data = vms.render(score)
-
-# Each glyph has: type, x, y, width, height, color, pitch, velocity, channel, room
-for glyph in data['glyphs'][:5]:
-    print(f"{glyph['type']}: room={glyph.get('room','?')} "
-          f"pitch={glyph.get('pitch','?')} at ({glyph['x']:.0f}, {glyph['y']:.0f})")
-
-# Save as JSON
-json_str = vms.render_to_json(score)
-with open("fleet_vms.json", "w") as f:
-    f.write(json_str)
 ```
 
-The VMS renders notes as colored rectangles on a 2D canvas:
-- X axis = time (left to right)
-- Y axis = pitch (bottom = low, top = high)
-- Color = channel/room
-- Width = duration
-- Height = velocity
+Output structure:
 
-## Full Pipeline Example
+```json
+{
+  "version": "v1",
+  "title": "PLATO Fleet Singing",
+  "width": 1920,
+  "height": 1080,
+  "duration_beats": 1847.25,
+  "glyphs": [
+    {
+      "type": "note",
+      "x": 234.5,
+      "y": 612.0,
+      "width": 5.2,
+      "height": 44.5,
+      "color": "#e6194b",
+      "pitch": 41,
+      "velocity": 89,
+      "channel": 7,
+      "room": "forgemaster-anvil",
+      "agent": "forge-agent",
+      "onset_beats": 12.5,
+      "duration_beats": 1.5
+    },
+    {
+      "type": "chord",
+      "x": 345.2,
+      "y": 20,
+      "width": 8.1,
+      "height": 16,
+      "color": "#ffffff",
+      "chord_type": "triad",
+      "rooms": ["forgemaster-anvil", "session-deep-dive"]
+    },
+    {
+      "type": "rest",
+      "x": 500.0,
+      "y": 1060,
+      "width": 3.8,
+      "height": 8,
+      "color": "#555555",
+      "room": "fleet-comms",
+      "duration_beats": 7.3
+    }
+  ]
+}
+```
+
+Note glyphs: positioned at (x=onset, y=pitch), sized by (width=duration, height=velocity).
+Chord glyphs: horizontal bars at the top.
+Rest glyphs: horizontal bars at the bottom.
+
+Colors are deterministic per MIDI channel (16 distinct hues).
+
+## Input/output formats
+
+### Input
+
+- **PLATO API**: HTTP JSON at `/rooms` and `/room/{name}`
+- **Tile dict**: `{"room", "category", "agent", "timestamp", "confidence", "question", "answer", "tile_id"}`
+- **Mapped note**: dict from `TileMapper.map_tile()`
+
+### Output
+
+- **MIDI**: Type-1 `.mid` file (via `MidiRenderer`)
+- **Tensor-MIDI**: 4-byte events, raw bytes or JSON (via `TensorMidiRenderer`)
+- **VMS**: JSON dict with glyph array (via `VMSRenderer`)
+- **Score summary**: JSON-serializable dict
+
+## Configuration reference
+
+### PlatoFetcher
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `host` | `str` | `"http://147.224.38.131:8847"` | PLATO server URL |
+| `timeout` | `float` | `5.0` | HTTP timeout in seconds |
+
+### SyntheticFetcher
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `seed` | `int` | `42` | Random seed for reproducibility |
+
+### PlatoScore
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `deadband_semitones` | `int` | `2` | Pitch change threshold |
+| `deadband_velocity` | `int` | `10` | Velocity change threshold |
+| `chord_window_beats` | `float` | `0.5` | Simultaneity window |
+| `rest_threshold_beats` | `float` | `2.0` | Gap threshold for rests |
+
+### MidiRenderer
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tempo_bpm` | `float` | `120.0` | Playback tempo |
+| `ticks_per_beat` | `int` | `480` | MIDI resolution |
+
+### TensorMidiRenderer
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `beat_resolution` | `int` | `24` | Ticks per beat for beat_k |
+
+### VMSRenderer
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `width` | `int` | `1920` | Canvas width in pixels |
+| `height` | `int` | `1080` | Canvas height in pixels |
+
+## Use cases
+
+### 1. Generate a MIDI file from fleet activity
 
 ```python
-from plato_room_musician import (
-    SyntheticFetcher, RoomMapper, TileMapper,
-    PlatoScore, MidiRenderer, TensorMidiRenderer, VMSRenderer
-)
+from plato_room_musician import SyntheticFetcher, RoomMapper, TileMapper, PlatoScore, MidiRenderer
 
-# 1. Fetch data
 fetcher = SyntheticFetcher(seed=42)
-all_tiles = fetcher.get_all_tiles()
+mapper = TileMapper(RoomMapper())
 
-# 2. Map to music
-rm = RoomMapper()
-tm = TileMapper(rm)
 mapped = []
-for room_name, tiles in all_tiles.items():
-    for tile in tiles:
-        mapped.append(tm.map_tile(room_name, tile))
+for name in fetcher.get_rooms():
+    for tile in fetcher.get_room(name)["tiles"]:
+        mapped.append(mapper.map_tile(name, tile))
 
-# 3. Build score
 score = PlatoScore.from_mapped_tiles(mapped)
-score.apply_deadband()
+score.normalize_time().apply_deadband()
 
-# 4. Render
-print(score.summary())
-MidiRenderer(120.0).render(score, "fleet.mid")
-print(f"Tensor-MIDI: {len(TensorMidiRenderer().render(score))} events")
+MidiRenderer(tempo_bpm=120).render(score, "fleet.mid")
 ```
 
-## Configuration Reference
-
-### `PlatoFetcher(host, timeout)`
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `host` | `"http://147.224.38.131:8847"` | PLATO server URL |
-| `timeout` | 5.0 | HTTP timeout in seconds |
-
-### `SyntheticFetcher(seed)`
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `seed` | 42 | RNG seed for reproducibility |
-
-### `PlatoScore.from_mapped_tiles(mapped_tiles, deadband_semitones=2, deadband_velocity=10, chord_window_beats=0.5, rest_threshold_beats=2.0)`
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `deadband_semitones` | 2 | Pitch change threshold for filtering |
-| `deadband_velocity` | 10 | Velocity change threshold |
-| `chord_window_beats` | 0.5 | Time window for chord detection |
-| `rest_threshold_beats` | 2.0 | Minimum gap to register as rest |
-
-### `MidiRenderer(tempo_bpm=120.0, ticks_per_beat=480)`
-
-Standard MIDI file rendering.
-
-### `TensorMidiRenderer(beat_resolution=24)`
-
-Higher resolution = finer beat quantization (24 = 24 ticks per beat).
-
-### `VMSRenderer(width=1920, height=1080)`
-
-Canvas size for visual rendering.
-
-## Common Patterns
-
-### Use live PLATO data
+### 2. Connect to live PLATO and stream
 
 ```python
 from plato_room_musician import PlatoFetcher, RoomMapper, TileMapper, PlatoScore, MidiRenderer
 
-fetcher = PlatoFetcher("http://your-plato:8847")
+fetcher = PlatoFetcher()
 all_tiles = fetcher.get_all_tiles()
 
-rm, tm = RoomMapper(), TileMapper()
-mapped = [tm.map_tile(room, tile) for room, tiles in all_tiles.items() for tile in tiles]
+mapper = TileMapper(RoomMapper())
+mapped = []
+for room, tiles in all_tiles.items():
+    for tile in tiles:
+        mapped.append(mapper.map_tile(room, tile))
 
 score = PlatoScore.from_mapped_tiles(mapped)
-score.apply_deadband()
-MidiRenderer(120.0).render(score, "live_fleet.mid")
+score.normalize_time().apply_deadband()
+MidiRenderer().render(score, "live_fleet.mid")
 ```
 
-### Export only specific rooms
+### 3. Export Tensor-MIDI for neural synthesis
 
 ```python
-target_rooms = {"forgemaster-cadence", "fleet-coord"}
-filtered = {k: v for k, v in all_tiles.items() if k in target_rooms}
-# ... then map and score as usual
+from plato_room_musician import TensorMidiRenderer
+
+renderer = TensorMidiRenderer(beat_resolution=48)
+raw = renderer.render_to_bytes(score)
+with open("fleet.tensor_midi", "wb") as f:
+    f.write(raw)
 ```
 
-### Adjust deadband for denser/sparser output
+### 4. Generate a Visual Music Score for a web dashboard
 
 ```python
-# Dense: keep almost everything
-score = PlatoScore.from_mapped_tiles(mapped, deadband_semitones=0, deadband_velocity=0)
+from plato_room_musician import VMSRenderer
+import json
 
-# Sparse: keep only big changes
-score = PlatoScore.from_mapped_tiles(mapped, deadband_semitones=5, deadband_velocity=20)
+vms = VMSRenderer(width=1920, height=1080)
+data = vms.render(score)
+with open("fleet_vms.json", "w") as f:
+    json.dump(data, f, indent=2)
+```
+
+### 5. Analyze fleet coordination patterns
+
+```python
+score = PlatoScore.from_mapped_tiles(mapped)
+score.normalize_time()
+
+chords = score.find_chords()
+print(f"Coordination events: {len(chords)}")
+for c in chords:
+    print(f"  Beat {c['onset_beats']:.1f}: {', '.join(c['rooms'])} ({c['type']})")
+
+rests = score.find_rests()
+print(f"Fleet idle periods: {len(rests)}")
+for r in rests:
+    print(f"  {r['room']}: {r['duration_beats']:.1f} beats silence")
+```
+
+### 6. Compare fleet activity across time periods
+
+```python
+# Period A
+synth_a = SyntheticFetcher(seed=42)
+tiles_a = synth_a.get_all_tiles()
+score_a = PlatoScore.from_mapped_tiles([...]).normalize_time()
+
+# Period B
+synth_b = SyntheticFetcher(seed=99)
+tiles_b = synth_b.get_all_tiles()
+score_b = PlatoScore.from_mapped_tiles([...]).normalize_time()
+
+print(f"Period A: {score_a.summary()}")
+print(f"Period B: {score_b.summary()}")
+```
+
+### 7. Custom room categories
+
+```python
+from plato_room_musician.mapping import CATEGORY_CONFIG, _category_from_name, RoomMapper, TileMapper
+
+# Add a new category
+CATEGORY_CONFIG["neural"] = {
+    "register": (84, 108),
+    "patches": [98, 99, 100],  # crystal, atmosphere, brightness
+    "scale": [0, 1, 3, 4, 6, 7, 9, 10],  # octatonic
+    "rhythmic_role": "irregular",
+}
+
+# Room names containing "neural" will auto-match
+mapper = TileMapper(RoomMapper())
+note = mapper.map_tile("neural-synth-lab", tile)
 ```
 
 ## Troubleshooting
 
-### `ConnectionError: PLATO unreachable`
+### "PLATO unreachable"
 
-The PLATO server is down or unreachable. Use `SyntheticFetcher` as a fallback:
+The PLATO server may be down or the URL wrong. Use `SyntheticFetcher` as fallback, or `get_fetcher()` which auto-falls back:
 
 ```python
 from plato_room_musician.fetcher import get_fetcher
-fetcher = get_fetcher()  # auto-falls back to synthetic
+fetcher = get_fetcher()  # tries live, falls back to synthetic
 ```
 
-### Too many/few events after deadband
+### No notes generated
 
-Adjust `deadband_semitones` and `deadband_velocity`:
-- Lower values → more events retained (denser texture)
-- Higher values → fewer events (sparser, only major changes)
+- Check that tiles have valid timestamps (not all zero)
+- Check that tile dicts have `confidence` > 0
+- Verify the room names match category prefixes
 
-### All notes in one channel
+### All notes on one channel
 
-If all your rooms hash to the same channel (unlikely but possible with many rooms), RoomMapper resolves collisions by incrementing. With 13 rooms and 16 channels, collisions are rare.
+With >16 rooms, MIDI channels must be reused (only 16 available). The mapper resolves collisions deterministically. This is expected behavior.
 
-### Timestamps are huge numbers
+### MIDI file is silent in my player
 
-Mapped tiles have raw Unix timestamps as `onset_beats`. Call `score.normalize_time()` (called automatically by renderers) to shift everything so the first note starts at beat 0.
+- Verify the tempo is reasonable (not 0 or extreme values)
+- Check that notes have velocity > 0
+- Ensure the MIDI file isn't empty (check file size)
+
+### Pitch range seems wrong
+
+Each category has a fixed register. Check `CATEGORY_CONFIG` for the room's category. The pitch is always clamped to `[register_low, register_high)`.
+
+### VMS JSON is too large
+
+Reduce the number of events by tightening the deadband:
+
+```python
+score = PlatoScore.from_mapped_tiles(
+    mapped,
+    deadband_semitones=5,    # wider = fewer events
+    deadband_velocity=20,
+)
+```
+
+### Synthetic data sounds repetitive
+
+The synthetic generator uses a fixed seed for reproducibility. Change the seed for different patterns:
+
+```python
+fetcher = SyntheticFetcher(seed=int(time.time()))
+```
