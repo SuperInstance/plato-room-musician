@@ -189,6 +189,12 @@ vms_json = vms.render_to_json(score)    # JSON string
 PLATO API ──> rooms + tiles ──> mapped notes ──> composed score ──> output format
 ```
 
+## Documentation
+
+- [User Guide](docs/USER-GUIDE.md) — Complete usage documentation
+- [Developer Guide](docs/DEVELOPER-GUIDE.md) — Contributing and internals
+- [Examples](examples/) — Working code examples
+
 ## Related repos
 
 - [holonomy-harmony](https://github.com/SuperInstance/holonomy-harmony) — Chord progression analysis via holonomy
