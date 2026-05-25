@@ -200,6 +200,10 @@ PLATO API ──> rooms + tiles ──> mapped notes ──> composed score ─�
 - [holonomy-harmony](https://github.com/SuperInstance/holonomy-harmony) — Chord progression analysis via holonomy
 - [spline-midi-smooth](https://github.com/SuperInstance/spline-midi-smooth) — Spline interpolation for MIDI automation
 - [tensor-midi](https://github.com/SuperInstance/tensor-midi) — INT8-saturated MIDI for neural synthesis
+- [flux-tensor-midi](https://github.com/SuperInstance/flux-tensor-midi) — Flux tensor MIDI for neural synthesis
+- [constraint-instrument](https://github.com/SuperInstance/constraint-instrument) — Constraint-based music generation (7 modes, 17 terrains)
+- [plato-core](https://github.com/SuperInstance/plato-core) — Foundation types and mesh registry
+- [cocapn-plato](https://github.com/SuperInstance/cocapn-plato) — Full PLATO SDK + server
 
 ## Requirements
 
